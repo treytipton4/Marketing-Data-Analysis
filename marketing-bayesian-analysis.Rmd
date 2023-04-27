@@ -1,0 +1,461 @@
+---
+title: "Final Project: Ad Campaign Acceptance"
+author: "Trey Tipton, Brent Gin"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r, setup, include = FALSE, message=FALSE}
+# load packages that are going to be used
+      # this loads ggformula (for plotting), etc. too
+
+# data wrangling
+library(tidyverse)
+
+# several packages for bayesian stuff -- more may come later
+library(rethinking)  # related to text
+library(tidybayes)    
+library(bayesplot)
+library(CalvinBayes)
+library(dagitty)
+library(rstan)
+
+# packages for EDA
+library(fuzzybunnies)
+library(plotly)
+
+#wrangling for EDA only
+market0 <- marketing_data |>
+  mutate(person_id = c(1:nrow(marketing_data))) |>
+  # pivot more to undo one-hot encoding (multiple binary columns to single categorical variables)
+  pivot_longer(cols = starts_with('marital'),
+               names_to = 'Marital_Status',
+               names_transform = ~stringr::str_split_i(.x, '_', i = 2), # keep only the part after the _
+               values_to = 'Marital_Keepers') |>
+  # now we want to keep only rows where Marital_Keepers is 1 and then delete that variable
+  filter(Marital_Keepers == 1) |>
+  select(-Marital_Keepers) |>
+  # do same for education
+  pivot_longer(cols = starts_with('education'),
+               names_to = 'Education',
+               names_transform = ~stringr::str_split_i(.x, '_', i = 2), # keep only the part after the _
+               values_to = 'Ed_Keepers') |>
+  # now we want to keep only rows where Ed_Keepers is 1 and then delete that variable
+  filter(Ed_Keepers == 1) |>
+  select(-Ed_Keepers) |>
+  mutate(Marital_Status = factor(Marital_Status),
+         Education = factor(Education))
+
+# Some customization. You can alter or delete as desired (if you know what you are doing).
+
+theme_set(theme_bw())     # change theme for ggplot2/ggformula
+
+knitr::opts_chunk$set(
+  tidy = FALSE,     # display code as typed (rather than reformatted)
+  fig.width = 4,    # adjust this to make figures wider or narrower
+  fig.height = 2.5, # adjust this to make figures taller or shorrter
+  size = "small")   # slightly smaller font for code
+```
+
+## The Data 
+
+Some wrangling:
+
+```{r}
+market <- marketing_data |>
+  mutate(person_id = c(1:nrow(market0))) |>
+  select(-AcceptedCmpOverall) |> # remove - we want to track response to campaigns separately not overall
+  # "pivot" to get multiple rows per person, one for each campaign
+  pivot_longer(cols = starts_with('Accepted'),
+               names_to = 'Campaign_Number',
+               names_transform = ~parse_number(.x),
+               values_to = 'Accepted_Campaign') |>
+  # pivot more to undo one-hot encoding (multiple binary columns to single categorical variables)
+  pivot_longer(cols = starts_with('marital'),
+               names_to = 'Marital_Status',
+               names_transform = ~stringr::str_split_i(.x, '_', i = 2), # keep only the part after the _
+               values_to = 'Marital_Keepers') |>
+  # now we want to keep only rows where Marital_Keepers is 1 and then delete that variable
+  filter(Marital_Keepers == 1) |>
+  select(-Marital_Keepers) |>
+  # do same for education
+  pivot_longer(cols = starts_with('education'),
+               names_to = 'Education',
+               names_transform = ~stringr::str_split_i(.x, '_', i = 2), # keep only the part after the _
+               values_to = 'Ed_Keepers') |>
+  # now we want to keep only rows where Ed_Keepers is 1 and then delete that variable
+  filter(Ed_Keepers == 1) |>
+  select(-Ed_Keepers) |>
+  mutate(Marital_Status = factor(Marital_Status),
+         Education = factor(Education),
+         Age_z = as.numeric(scale(Age)),
+         Customer_Days_z = as.numeric(scale(Customer_Days)),
+         Income_z = as.numeric(scale(Income)))
+
+stan_data <- compose_data(market)
+```
+
+The data comes from a kaggle Data Card [shown here](https://www.kaggle.com/datasets/jackdaoud/marketing-data) and is publicly available on [github](https://github.com/nailson/ifood-data-business-analyst-test). It is also available using the fuzzybunnies R Package (called "marketing_data") or can be read in from this [link](https://raw.githubusercontent.com/nailson/ifood-data-business-analyst-test/master/ifood_df.csv). It is data from customer characteristics from an unknown food company and whether/when they accepted the company's ad campaign. It contains customer characteristics such as their income, marital status, number of children in the home, education, purchasing habits, days of being a customer, days since last purchase, etc. The main variable of interest is whether or not customers aaccepted the campaigns, meaning which of the company's ad campaigns prompted the customer to buy some unknown product. The company released 6 ad campaigns and the data contains:
+
+- multiple rows per person, 
+- a binary variable saying whether they accepted, 
+- another column saying which campaign it was.
+
+The age, days of being a customer, and income are also scaled for simplicity of priors.
+
+Let's take a quick look at the data:
+
+```{r}
+head(market)
+```
+
+## Research Question
+
+We want to investigate a link between customer characteristics and whether or not a person chose to accept an ad campaign, so we would like to answer this question by fitting a bayesian model:
+
+Which customer characteristics or purchasing habits affect the proportion of accepted campaigns?
+
+## Causal Diagram
+
+```{r}
+# create the DAG object
+causal_diagram_1 <- dagitty("dag{
+  income -> AcceptedCampaign
+  income -> PurchasingHabits
+  age -> AcceptedCampaign
+  age -> income
+  age -> education
+  education -> income
+  education -> AcceptedCampaign
+  marital_status -> income
+  marital_status -> KidHome
+  marital_status -> TeenHome
+  Complain -> AcceptedCampaign
+  Campaign_Number -> AcceptedCampaign
+}")
+# plot it
+gg_dag(causal_diagram_1)
+
+```
+
+Rationale: We want to focus our understanding on the effect of Campaign_Number on the proportion of Accepted Campaigns. We want to see if people are more likely to accept on a different or repeated campaign. Age and income both directly affect the proportion of accepted campaigns; how old someone is or how much money they make would definitely affect their likelihood of accepting an ad campaign. Age is a confounder and we therefore will include it in the model; income is a mediator so we will also include that as a predictor. Education affects income as higher education indicates higher salaries, and we should therefore add an interaction in our model between income and education. Age affects education as older people are more likely to have gotten a higher education. We will include education to see the extent of these affects (potential interaction with age or income???). Marital status affects income as married people might make more money. Marital status also affects the number of kids or teens that are in the home. Therefore, we will include marital status but not the number of teens or kids in the home, to keep our model simple.
+
+## Exploratory Data Analysis
+
+The dataset shows information of 2205 customers, so let's just see how many of them accepted the ad campaigns. To do this, plotly needs the data and the variable of interest; I factored it so that it was categorical, a number of how many campaigns they accepted from 0-6. 
+
+```{r}
+plot_ly(market0, x = ~factor(AcceptedCmpOverall)) %>% 
+  layout(title = "Ad Campaigns Accepted",
+         xaxis = list(title = "Number of Accepted Ad Campaigns Per Customer"),
+         yaxis = list (title = "Count"))
+```
+
+Clearly, most customers did not accept any of the ad campaigns, some accepted one, less accepted two of them, etc. 
+
+Let's see the distribution of customer incomes for each of the number of campaigns accepted (0-4, looks like no one accepted 5 or 6 of the campaigns). 
+
+```{r}
+plot_ly(market0, x = ~factor(AcceptedCmpOverall), y = ~Income, type = 'box') %>% 
+  layout(title = "Distribution of Customer Incomes",
+         xaxis = list(title = "Number of Accepted Ad Campaigns Per Customer"),
+         yaxis = list (title = "Customer Income"))
+```
+
+It seems that the more income a customer receives, the more ad campaigns they would accept. This makes sense, as customers that make more money can buy more things. Income therefore seems to affect how likely a customer is to accept an ad campaign, so we should include it in our model as a predictor.
+
+How similar were the ad campaigns? Were possibly released at different times, some perhaps when people might be more likely to buy? Let's find out by looking at how many of each campaign were accepted.
+
+
+```{r}
+plot_ly(market, x = ~factor(Campaign_Number), color = ~factor(Accepted_Campaign), type = 'histogram') %>% 
+  layout(title = "Number Accepted (Blue) vs. Not Accepted (Green)",
+         xaxis = list(title = "Campaign Number"),
+         yaxis = list (title = "Count"))
+```
+
+Most of them look the same, and since each customer was offered all five campaigns, we can compare the counts directly rather than percentages. The second campaign seemed to have a lot lower acceptance rate, for some unknown reason. Let's look into to adding the campaign number into our model as a predictor for whether a campaign was accepted.
+
+Let's see if the amount that they buy of a certain product has an affect on whether the customers accepted the campaign.
+
+```{r}
+plot_ly(market, x = ~MntMeatProducts, y = ~Income, color = ~factor(Accepted_Campaign), type = 'scatter') %>% 
+  layout(title = "Comparing Income and Meat Purchases by Ad Campaign Acceptance",
+         xaxis = list(title = "Number of Meat Purchases"),
+         yaxis = list (title = "Income"))
+```
+
+There appears to be an interesting relationship between customers' income and their meat purchases, however, I am not seeing much disparity in the distribution whether they accepted the campaign or not. Perhaps this is because income affects both purchases and ad campaign acceptance, but purchases do not affect ad campaign acceptance, at least for meat. Our causal diagram shows this, and we will therefore not include purchasing habits as predictors. We are not so much interested in that aspect anyways; we want to see what characteristics about customers predict their likelihood of acceptance. 
+
+## Model Description
+
+Description of Model:
+
+For the response, we will be using the Accepted_Campaign variable, which is binary, 1 for Accepted, 0 for did not accept..
+
+$$\text{Accepted_Campaign} \sim \text{Binomial}(1, \text{p}_i)$$
+$$logit(p_i) = a + b_1[\text{CampaignNumber}_{i}] + b_2[\text{MaritalStatus}_{i}] + b_3[\text{Education}_{i}]*\text{Income_z}_{i} + b_4*\text{Age_z}_{i} + b_5*\text{CustomerDays_z}_{i}$$
+
+
+$$a \sim \text{Normal}(.5, 1)$$
+
+$$b_1 \sim \text{Normal}(0, 1)$$
+
+$$b_2 \sim \text{Normal}(0, 1)$$
+
+$$b_3 \sim \text{Normal}(0, 1)$$
+
+$$b_4 \sim \text{Normal}(0, 1)$$
+
+$$b_5 \sim \text{Normal}(0, 1)$$
+
+Rationale for prior choices:
+
+For the intercept value, a, we guess a normal distribution with a mean of .5 and a standard deviation of 1. This is because we are unsure what the proportion would look like with all of the other values being zero. Because of our uncertainty, we guess in the middle but the standard deviation covers any possible intercept value.
+
+For the rest of the variables, we guess a normal distribution with a mean of 0 and standard deviation of 1. Since the quantitative variables are scaled, this means that we are unsure what logit(p) does as these coefficients change. The priors should cover any possible values.
+
+## Prior Predictive Check
+
+```{r}
+n_sim <- 100 # number of simulated datasets - can increase for more resolution or decrease to save time/avoid crashing R or if viz can't show this many anyway
+prior_pred_dist <- tibble(
+  sim_id = c(1:n_sim)) |>
+  # add row numbers to identify each draw from the posterior
+  mutate(# draw n_sim values of each parameter from its prior
+    a = rnorm(n_sim, mean = .5, sd = 1),
+    b1 =  rnorm(n_sim, mean = 0, sd = 1),
+    b2_1 =  rnorm(n_sim, mean = 0, sd = 1),
+    b2_2 =  rnorm(n_sim, mean = 0, sd = 1),
+    b2_3 =  rnorm(n_sim, mean = 0, sd = 1),
+    b2_4 =  rnorm(n_sim, mean = 0, sd = 1),
+    b2_5 =  rnorm(n_sim, mean = 0, sd = 1),
+    b4 =  rnorm(n_sim, mean = 0, sd = 1),
+    b5 =  rnorm(n_sim, mean = 0, sd = 1),
+    b6 =  rnorm(n_sim, mean = 0, sd = 1),
+  ) |>
+  rowwise()  |> # one sim dataset per row (= per set of parameters)
+  mutate(
+    p = list(inv_logit(a + b1 * market$Campaign_Number + 
+                       b2_1 * ifelse(market$Marital_Status == 1, 1, 0) +
+                    b2_2 * ifelse(market$Marital_Status == 2, 1, 0) +
+                      b2_3 * ifelse(market$Marital_Status == 3, 1, 0) +
+                      b2_4 * ifelse(market$Marital_Status == 4, 1, 0) +
+                      b2_5 * ifelse(market$Marital_Status == 5, 1, 0) +
+                    b4 * market$Age_z + b5 * market$Customer_Days_z + b6 * market$Income_z)),
+    Campaign_Number = list(market$Campaign_Number),
+    Marital_Status = list(market$Marital_Status),
+    Age_z = list(market$Age_z),
+    Customer_Days_z = list(market$Customer_Days_z),
+    Income_z = list(market$Income_z)
+  ) |>
+  unnest(cols = c(Campaign_Number, Marital_Status, Age_z, Customer_Days_z, Income_z, p)) |>
+  ungroup() |>
+  rowwise() |>
+  mutate(
+    sim_dur = rbinom(n = 1, size = 1, prob = p)
+    ) |>
+  ungroup()
+```
+
+
+```{r}
+gf_histogram(~sim_dur, group = ~sim_id, 
+        data = prior_pred_dist)
+```
+
+## Fit the model
+
+We are interested in investigating a link between whether or not someone accepted an ad campaign and their characteristics such as their income, marital status, age, and education. So let us fit the model in stan with Accepted_Campaign as the response variable. Let's also include an interaction between education and income for this model, then create another model without the interaction and compare.
+
+```{r}
+stan_model <- '
+data{
+    int<lower=1> n;
+    array[n] int Accepted_Campaign; // response
+    array[n] int Campaign_Number;  // categorical predictor stored as integer indices
+    array[n] int Marital_Status;  // categorical predictor stored as integer indices
+    array[n] int Education;  // categorical predictor stored as integer indices
+    vector[n] Age_z;  // quantitative predictor
+    vector[n] Customer_Days_z;  // quantitative predictor
+    vector[n] Income_z;  // quantitative predictor
+}
+parameters{
+    real a;
+    vector[5] b1;
+    vector[5] b2;
+    vector[5] b3;
+    real b4;
+    real b5;
+}
+model{
+    vector[n] p; // probability of accepting campaign
+    b1 ~ normal(0,1);
+    a ~ normal(0.5,1);
+    b2 ~ normal(0,1);
+    b3 ~ normal(0,1);
+    b4 ~ normal(0,1);
+    b5 ~ normal(0,1);
+    for ( i in 1:n ) {
+        p[i] = inv_logit(a + b1[Campaign_Number[i]] + b2[Marital_Status[i]] + b3[Education[i]]*Income_z[i] + b4*Age_z[i] + b5*Customer_Days_z[i]);
+    }
+    Accepted_Campaign ~ binomial( 1 , p ); // the 1 is for 1 "trial" per row of data
+}
+generated quantities{
+    vector[n] p;
+    vector[n] log_lik;
+    for ( i in 1:n ) {
+        p[i] = inv_logit(a + b1[Campaign_Number[i]] + b2[Marital_Status[i]] + b3[Education[i]]*Income_z[i] + b4*Age_z[i] + b5*Customer_Days_z[i]);
+        // computing the log likelihood
+    log_lik[i] = binomial_logit_lpmf(Accepted_Campaign[i] | 1, a + b1[Campaign_Number[i]] + b2[Marital_Status[i]] + b3[Education[i]]*Income_z[i] + b4*Age_z[i] + b5*Customer_Days_z[i]);
+    }
+}
+'
+```
+
+
+
+
+```{r}
+model <- stan(model_code = stan_model, data = stan_data, warmup = 750, iter = 1500, chains = 2)
+```
+
+Now we will create the second model without the interaction between education and income.
+
+```{r}
+stan_model2 <- '
+data{
+    int<lower=1> n;
+    array[n] int Accepted_Campaign; // response
+    array[n] int Campaign_Number;  // categorical predictor stored as integer indices
+    array[n] int Marital_Status;  // categorical predictor stored as integer indices
+    array[n] int Education;  // categorical predictor stored as integer indices
+    vector[n] Age_z;  // quantitative predictor
+    vector[n] Customer_Days_z;  // quantitative predictor
+    vector[n] Income_z;  // quantitative predictor
+}
+parameters{
+    real a;
+    vector[5] b1;
+    vector[5] b2;
+    vector[5] b3;
+    real b4;
+    real b5;
+    real b6;
+}
+model{
+    vector[n] p; // probability of accepting campaign
+    b1 ~ normal(0,1);
+    a ~ normal(0.5,1);
+    b2 ~ normal(0,1);
+    b3 ~ normal(0,1);
+    b4 ~ normal(0,1);
+    b5 ~ normal(0,1);
+    b6 ~ normal(0,1);
+    for ( i in 1:n ) {
+        p[i] = inv_logit(a + b1[Campaign_Number[i]] + b2[Marital_Status[i]] + b3[Education[i]] + b4*Age_z[i] + b5*Customer_Days_z[i] + b6*Income_z[i]);
+    }
+    Accepted_Campaign ~ binomial( 1 , p ); // the 1 is for 1 "trial" per row of data
+}
+generated quantities{
+    vector[n] p;
+    vector[n] log_lik;
+    for ( i in 1:n ) {
+        p[i] = inv_logit(a + b1[Campaign_Number[i]] + b2[Marital_Status[i]] + b3[Education[i]] + b4*Age_z[i] + b5*Customer_Days_z[i] + b6*Income_z[i]);
+        log_lik[i] = binomial_logit_lpmf(Accepted_Campaign[i] | 1, a + b1[Campaign_Number[i]] + b2[Marital_Status[i]] + b3[Education[i]] + b4*Age_z[i] + b5*Customer_Days_z[i] + b6*Income_z[i]);
+    }
+}
+'
+```
+
+
+
+```{r}
+model2 <- stan(model_code = stan_model2, data = stan_data)
+```
+
+## Model Comparison
+
+Now we will compare the original model with the model without the interaction using WAIC scores:
+
+```{r}
+rethinking::compare(model, model2, func = WAIC)
+```
+
+According to the similar WAIC scores and the standard errors that come from them, we do not have enough evidence to say that one model is better than the other. The first model, with the interaction between education and income, does have a better WAIC score, but the difference is not enough to say that the model is significantly better. With that said, for presenting the posterior, we will stick with the original model with the interaction.
+
+## Diagnostics
+
+![](model.JPG)
+
+After originally running the model without specifying any warmup iterations, post-warmup iterations, or chains, there were some problems with the diagnostics. Several of the Rhat values were above 1.00 and there were some low n_eff values. After increasing the warmup iterations to 750, the post-warmup iterations to 1500, and the chains to 2, the diagnostics look significantly better. All of the n_eff values are well above or close to 400 and the Rhat values all appear to be 1.00. 
+
+
+## Present the Posterior
+
+The model shown above does show some useful insight for the intercept and slope values. Looking at their means, you can see how each predictor generally affected the proportion of people that accepted ad campaigns. 
+
+For example, looking at the means of the b1 values, which is the coefficient for the campaign number, we see that all of them have values slightly below zero, except that the mean of b1[2] is -1.91, much lower. This tells me that the second campaign specifically makes it less likely for a person to accept an ad campaign. If we were doing this analysis for the company, this would be a useful insight for them as they should probably look into the difference in the second ad campaign compared to the rest and see why it did not perform as well for them. This lines up with the EDA we did earlier, hence why we included campaign number as a predictor.
+
+As far as the p values go, the model generated thousands of samples, but looking at the first 83, you can get a general idea of what the proportions look like. Most of them appear to be low, between .01 and .14. This means that we can see how well the ad campaigns are doing. However, let us look more in depth at the posterior to get a better idea.
+
+```{r}
+post_sample <- as.data.frame(model)
+
+#Remove brackets and replace with underscore
+names(post_sample) <- gsub("]","",names(post_sample))
+names(post_sample) <- gsub("\\[","_",names(post_sample))
+```
+
+
+```{r}
+gf_dens(~a, data = post_sample)
+inv_logit(-2.26)
+```
+
+This is a distribution of the intercept values that the model gave for the posterior. This shows that, given that inv_logit(-2.26), when all of the other predictors are zero (for quantitative variables, that means that they are the average of that variable since we scaled them), the proportion of accepted ad campaigns is around .09. 
+
+Let's do this for some of the other variables:
+
+```{r}
+gf_dens(~b4, data = post_sample)
+gf_dens(~b5, data = post_sample)
+```
+
+Given that b4 is the coefficient of the scaled age variable, this shows that age has a very slight negative impact on how likely someone is to accept an ad campaign. This means that the older someone is, the less likely they are to have accepted the ad campaign.
+
+As far as b5 goes, the distribution shows that the number of days that someone has been a customer has little impact on how likely they are to accept an ad campaign.
+
+Since we included the interaction between income and education, let's look at the coefficients for those variables.
+
+
+```{r}
+gf_dens(~b3_1, data = post_sample)
+gf_dens(~b3_2, data = post_sample)
+gf_dens(~b3_3, data = post_sample)
+gf_dens(~b3_4, data = post_sample)
+gf_dens(~b3_5, data = post_sample)
+
+```
+
+The fact that the distributions and centers are slightly different for each of these shows that the education that someone got is a good indication of how likely someone is to accept an ad campaign. The fact that all of them center above zero shows me that income is a solid predictor of how likely someone is to accept an ad campaign. The positive values means that the higher income someone has, the more likely they are to accept an ad campaign, as expected. The center and spread for b3_2 is lower than the rest; this indicates to us that having a basic education, as opposed to the higher educations like masters and phd, makes it less likely for someone to accept an ad campaign.
+
+Now let's have a deeper look at some of the proportions that the model gave us form the posterior sample:
+
+```{r}
+post_sample_p <- post_sample[19:21] %>% 
+  pivot_longer(cols = everything())
+```
+
+```{r}
+gf_dens(~value, data = post_sample_p) + 
+  facet_wrap(~name)
+```
+
+
+# Discussion
+
+With all that we have done, we can successfully answer our research question stated at the beginning. There does appear to be a link between customer characteristics and whether or not someone chose to accept an ad campaign. The customer characteristics that affect the proportion of accepted campaigns are the campaign number, customers' income, education, marital status, and age. We discovered that the second ad campaign predicted a lower proportion of ad campaign acceptance as opposed to the other four campaigns. We learned that higher incomes predicted a higher acceptance rate and that younger people were more likely to accept than older people. We also learned a lot about how the education level affected ad campaign acceptance, as higher education levels predicted higher acceptance. We also learned a lot about the proportion itself, finding out that the ad campaign acceptance rate is fairly low.
