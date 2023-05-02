@@ -6,4 +6,4 @@ The data comes from a kaggle Data Card [shown here](https://www.kaggle.com/datas
 
 I used stan to fit a binomial bayesian model with the response variable being a binary variable stating whether a customer accepted the campaign or not. The predictors were both quantitative and categorical and included customer characteristics such as income, education, marital status, etc. The data contains multiple rows per person, as the company release more than one campaign to each customer.
 
-Here is the HTML of the entire modeling process: [Marketing Bayesian Analysis](https://htmlpreview.github.io/?https://github.com/treytipton4/Marketing-Data-Analysis/blob/main/marketing-bayesian-analysis.html)
+Here is the HTML of the entire modeling process: [Marketing Bayesian Analysis](https://htmlpreview.github.io/?https://github.com/treytipton4/Marketing-Data-Analysis/blob/master/marketing-bayesian-analysis.html)
