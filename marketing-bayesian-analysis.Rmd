@@ -25,7 +25,8 @@ library(rstan)
 
 # packages for EDA
 library(fuzzybunnies)
-library(plotly)
+
+
 
 #wrangling for EDA only
 market0 <- marketing_data |>
@@ -120,75 +121,10 @@ Which customer characteristics or purchasing habits affect the proportion of acc
 
 ## Causal Diagram
 
-```{r}
-# create the DAG object
-causal_diagram_1 <- dagitty("dag{
-  income -> AcceptedCampaign
-  income -> PurchasingHabits
-  age -> AcceptedCampaign
-  age -> income
-  age -> education
-  education -> income
-  education -> AcceptedCampaign
-  marital_status -> income
-  marital_status -> KidHome
-  marital_status -> TeenHome
-  Complain -> AcceptedCampaign
-  Campaign_Number -> AcceptedCampaign
-}")
-# plot it
-gg_dag(causal_diagram_1)
+![](causal-diagram.JPG)
 
-```
+Rationale: We want to focus our understanding on the effect of Campaign_Number on the proportion of Accepted Campaigns. We want to see if people are more likely to accept on a different or repeated campaign. Age and income both directly affect the proportion of accepted campaigns; how old someone is or how much money they make would definitely affect their likelihood of accepting an ad campaign. Age is a confounder and we therefore will include it in the model; income is a mediator so we will also include that as a predictor. Education affects income as higher education indicates higher salaries, and we should therefore add an interaction in our model between income and education. We will include education to see the extent of these affects. Marital status affects income as married people might make more money. Marital status also affects the number of kids or teens that are in the home. Therefore, we will include marital status but not the number of teens or kids in the home, to keep our model simple.
 
-Rationale: We want to focus our understanding on the effect of Campaign_Number on the proportion of Accepted Campaigns. We want to see if people are more likely to accept on a different or repeated campaign. Age and income both directly affect the proportion of accepted campaigns; how old someone is or how much money they make would definitely affect their likelihood of accepting an ad campaign. Age is a confounder and we therefore will include it in the model; income is a mediator so we will also include that as a predictor. Education affects income as higher education indicates higher salaries, and we should therefore add an interaction in our model between income and education. Age affects education as older people are more likely to have gotten a higher education. We will include education to see the extent of these affects (potential interaction with age or income???). Marital status affects income as married people might make more money. Marital status also affects the number of kids or teens that are in the home. Therefore, we will include marital status but not the number of teens or kids in the home, to keep our model simple.
-
-## Exploratory Data Analysis
-
-The dataset shows information of 2205 customers, so let's just see how many of them accepted the ad campaigns. To do this, plotly needs the data and the variable of interest; I factored it so that it was categorical, a number of how many campaigns they accepted from 0-6. 
-
-```{r}
-plot_ly(market0, x = ~factor(AcceptedCmpOverall)) %>% 
-  layout(title = "Ad Campaigns Accepted",
-         xaxis = list(title = "Number of Accepted Ad Campaigns Per Customer"),
-         yaxis = list (title = "Count"))
-```
-
-Clearly, most customers did not accept any of the ad campaigns, some accepted one, less accepted two of them, etc. 
-
-Let's see the distribution of customer incomes for each of the number of campaigns accepted (0-4, looks like no one accepted 5 or 6 of the campaigns). 
-
-```{r}
-plot_ly(market0, x = ~factor(AcceptedCmpOverall), y = ~Income, type = 'box') %>% 
-  layout(title = "Distribution of Customer Incomes",
-         xaxis = list(title = "Number of Accepted Ad Campaigns Per Customer"),
-         yaxis = list (title = "Customer Income"))
-```
-
-It seems that the more income a customer receives, the more ad campaigns they would accept. This makes sense, as customers that make more money can buy more things. Income therefore seems to affect how likely a customer is to accept an ad campaign, so we should include it in our model as a predictor.
-
-How similar were the ad campaigns? Were possibly released at different times, some perhaps when people might be more likely to buy? Let's find out by looking at how many of each campaign were accepted.
-
-
-```{r}
-plot_ly(market, x = ~factor(Campaign_Number), color = ~factor(Accepted_Campaign), type = 'histogram') %>% 
-  layout(title = "Number Accepted (Blue) vs. Not Accepted (Green)",
-         xaxis = list(title = "Campaign Number"),
-         yaxis = list (title = "Count"))
-```
-
-Most of them look the same, and since each customer was offered all five campaigns, we can compare the counts directly rather than percentages. The second campaign seemed to have a lot lower acceptance rate, for some unknown reason. Let's look into to adding the campaign number into our model as a predictor for whether a campaign was accepted.
-
-Let's see if the amount that they buy of a certain product has an affect on whether the customers accepted the campaign.
-
-```{r}
-plot_ly(market, x = ~MntMeatProducts, y = ~Income, color = ~factor(Accepted_Campaign), type = 'scatter') %>% 
-  layout(title = "Comparing Income and Meat Purchases by Ad Campaign Acceptance",
-         xaxis = list(title = "Number of Meat Purchases"),
-         yaxis = list (title = "Income"))
-```
-
-There appears to be an interesting relationship between customers' income and their meat purchases, however, I am not seeing much disparity in the distribution whether they accepted the campaign or not. Perhaps this is because income affects both purchases and ad campaign acceptance, but purchases do not affect ad campaign acceptance, at least for meat. Our causal diagram shows this, and we will therefore not include purchasing habits as predictors. We are not so much interested in that aspect anyways; we want to see what characteristics about customers predict their likelihood of acceptance. 
 
 ## Model Description
 
